@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en" id="top">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wynncraft Build System</title>
+  <style>
+    :root {
+      --bg-1: #040812;
+      --bg-2: #081120;
+      --panel: rgba(10, 18, 34, 0.78);
+      --panel-strong: rgba(7, 13, 26, 0.95);
+      --line: rgba(110, 180, 255, 0.18);
+      --text: #ecf4ff;
+      --muted: #93a7c6;
+      --accent: #65b2ff;
+      --accent-2: #a777ff;
+      --success: #79ffb1;
+      --warn: #ffd36a;
+      --danger: #ff7b9b;
+      --shadow: 0 20px 45px rgba(0,0,0,0.35);
+      --radius: 20px;
+      --danger-line: rgba(255, 123, 155, 0.35);
+      --warn-line: rgba(255, 211, 106, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: Inter, Arial, Helvetica, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top, rgba(101,178,255,0.13), transparent 35%),
+        radial-gradient(circle at 80% 15%, rgba(167,119,255,0.10), transparent 30%),
+        linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 45%, #050914 100%);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+      background-size: 28px 28px;
+      opacity: 0.55;
+      z-index: 0;
+    }
+
+    .container {
+      width: min(1180px, calc(100% - 24px));
+      margin: 0 auto;
+      position: relative;
+      z-index: 1;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(14px);
+      background: rgba(4, 9, 19, 0.72);
+      border-bottom: 1px solid rgba(101,178,255,0.10);
+    }
+
+    .topbar-inner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 18px;
+      padding: 14px 0;
+    }
+
+    .brand {
+      font-weight: 800;
+      font-size: 0.95rem;
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .nav a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.92rem;
+      transition: 0.2s ease;
+    }
+
+    .nav a:hover { color: var(--text); }
+
+    section { padding: 18px 0 54px; }
+
+    .hero {
+      min-height: 70vh;
+      display: flex;
+      align-items: center;
+      padding: 72px 0 36px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 24px;
+      align-items: center;
+    }
+
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.26em;
+      font-size: 0.75rem;
+      color: var(--accent);
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0 0 16px;
+      font-size: clamp(2.6rem, 6vw, 5.4rem);
+      line-height: 0.95;
+      text-transform: uppercase;
+      letter-spacing: -0.04em;
+    }
+
+    .gradient-text {
+      background: linear-gradient(90deg, #ffffff 0%, #88c2ff 55%, #b79cff 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .hero p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 1.05rem;
+      line-height: 1.75;
+      max-width: 690px;
+    }
+
+    .btn-row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 18px;
+      border-radius: 14px;
+      border: 1px solid rgba(101,178,255,0.18);
+      color: var(--text);
+      text-decoration: none;
+      background: rgba(255,255,255,0.025);
+      transition: 0.2s ease;
+      font-weight: 700;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: rgba(101,178,255,0.45);
+      box-shadow: 0 0 26px rgba(101,178,255,0.12);
+    }
+
+    .btn.primary {
+      background: linear-gradient(90deg, rgba(101,178,255,0.18), rgba(167,119,255,0.18));
+      box-shadow: 0 0 0 1px rgba(101,178,255,0.08), 0 0 30px rgba(101,178,255,0.15);
+    }
+
+    .btn.small { min-height: 40px; padding: 0 14px; font-size: 0.92rem; border-radius: 12px; }
+
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+
+    .panel {
+      background: rgba(10, 18, 34, 0.78);
+      border: 1px solid rgba(110, 180, 255, 0.18);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    .panel-strong { background: rgba(7, 13, 26, 0.95); }
+
+    .hero-card { padding: 22px; position: relative; overflow: hidden; }
+
+    .panel-title {
+      text-transform: uppercase;
+      letter-spacing: 0.22em;
+      font-size: 0.75rem;
+      color: var(--accent);
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .muted-mini { color: var(--muted); font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; }
+
+    .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .stat-box {
+      border: 1px solid rgba(101,178,255,0.12);
+      background: rgba(255,255,255,0.02);
+      border-radius: 16px;
+      padding: 14px;
+    }
+    .stat-label { text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.72rem; color: var(--muted); margin-bottom: 8px; }
+    .stat-value { font-size: 1rem; font-weight: 700; }
+
+    .builder-layout { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 18px; align-items: start; }
+
+    form { display: grid; gap: 16px; }
+    .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+    .field { display: flex; flex-direction: column; gap: 8px; }
+    label { text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.72rem; color: var(--accent); }
+
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid rgba(101,178,255,0.14);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.03);
+      color: var(--text);
+      padding: 13px 14px;
+      font: inherit;
+      outline: none;
+      transition: 0.2s ease;
+    }
+
+    textarea { min-height: 98px; resize: vertical; }
+
+    .danger-outline { border-color: var(--danger-line) !important; box-shadow: 0 0 0 3px rgba(255,123,155,0.10) !important; }
+    .warn-outline { border-color: var(--warn-line) !important; box-shadow: 0 0 0 3px rgba(255,211,106,0.08) !important; }
+
+    .summary-list { display: grid; gap: 12px; }
+    .summary-item {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(101,178,255,0.10);
+      background: rgba(255,255,255,0.02);
+    }
+
+    .analysis-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 16px; }
+
+    .analysis-box {
+      border: 1px solid rgba(101,178,255,0.12);
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+      border-radius: 16px;
+      padding: 16px;
+    }
+
+    .analysis-kicker { color: var(--muted); text-transform: uppercase; letter-spacing: 0.15em; font-size: 0.68rem; margin-bottom: 8px; }
+    .analysis-value { font-size: 1.45rem; font-weight: 800; margin-bottom: 8px; }
+    .analysis-desc { color: var(--muted); line-height: 1.55; font-size: 0.9rem; }
+
+    .alerts { display: grid; gap: 12px; margin-top: 16px; }
+
+    .alert {
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+      padding: 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.03);
+    }
+
+    .pill {
+      flex: 0 0 auto;
+      padding: 7px 10px;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 0.68rem;
+      font-weight: 800;
+      min-width: 92px;
+      text-align: center;
+    }
+
+    .pill.good { color: var(--success); background: rgba(121,255,177,0.13); }
+    .pill.warn { color: var(--warn); background: rgba(255,211,106,0.12); }
+    .pill.danger { color: var(--danger); background: rgba(255,123,155,0.12); }
+
+    @media (max-width: 1050px) {
+      .hero-grid,
+      .builder-layout,
+      .analysis-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 760px) {
+      .field-grid,
+      .stat-grid { grid-template-columns: 1fr; }
+      .topbar-inner { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">Wynncraft Build System</div>
+      <nav class="nav" aria-label="Primary navigation">
+        <a href="#builder">Builder</a>
+        <a href="#analysis">Analysis</a>
+        <a href="#recommendations">Recommendations</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <div class="eyebrow">System Initialization</div>
+          <h1><span class="gradient-text">Ascend Your</span><br>Wynncraft Build</h1>
+          <p>
+            Build page with autosave, share links, point budgeting, improved analysis, and recommendations.
+          </p>
+
+          <div class="btn-row">
+            <a href="#builder" class="btn primary">Start Build</a>
+            <a href="#analysis" class="btn">View Analysis</a>
+          </div>
+
+          <div class="toolbar">
+            <button class="btn small" id="btnCopyShare" type="button">Copy Share Link</button>
+            <button class="btn small" id="btnOpenJson" type="button">Import / Export JSON</button>
+            <button class="btn small" id="btnLoadExample" type="button">Load Example</button>
+            <button class="btn small" id="btnReset" type="button">Reset</button>
+          </div>
+        </div>
+
+        <div class="panel hero-card panel-strong">
+          <div class="panel-title">
+            <span>Live System Preview</span>
+            <span class="muted-mini" id="autosaveStatus">Autosave: Ready</span>
+          </div>
+          <div class="stat-grid">
+            <div class="stat-box"><div class="stat-label">Class</div><div class="stat-value" id="previewClass">Shaman</div></div>
+            <div class="stat-box"><div class="stat-label">Archetype</div><div class="stat-value" id="previewArchetype">High DPS + Sustain</div></div>
+            <div class="stat-box"><div class="stat-label">Weapon</div><div class="stat-value" id="previewWeapon">Absolution Relik</div></div>
+            <div class="stat-box"><div class="stat-label">Level</div><div class="stat-value" id="previewLevel">105</div></div>
+            <div class="stat-box"><div class="stat-label">Goal</div><div class="stat-value" id="previewGoal">Raid Ready</div></div>
+            <div class="stat-box"><div class="stat-label">Budget</div><div class="stat-value" id="previewBudget">Remaining: 0</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="builder">
+      <div class="container">
+        <div class="panel card panel-strong" style="padding:20px;">
+          <form id="buildForm" autocomplete="off">
+            <div class="field-grid">
+              <div class="field">
+                <label for="classSelect">Class</label>
+                <select id="classSelect"><option>Archer</option><option>Warrior</option><option>Mage</option><option>Assassin</option><option selected>Shaman</option></select>
+              </div>
+              <div class="field">
+                <label for="archetypeSelect">Archetype</label>
+                <select id="archetypeSelect"><option>Burst Damage</option><option>Spell Spam</option><option>Melee Pressure</option><option>Hybrid Utility</option><option>Raid Survival</option><option selected>High DPS + Sustain</option></select>
+              </div>
+              <div class="field">
+                <label for="levelInput">Level</label>
+                <input id="levelInput" type="number" value="105" min="1" max="105">
+              </div>
+              <div class="field">
+                <label for="goalSelect">Goal</label>
+                <select id="goalSelect"><option>Maximum DPS</option><option>Solo Bossing</option><option>Spell Efficiency</option><option selected>Raid Ready</option><option>Hybrid Build</option><option>Budget Friendly</option></select>
+              </div>
+              <div class="field"><label for="weaponInput">Weapon</label><input id="weaponInput" value="Absolution Relik" /></div>
+              <div class="field"><label for="powdersInput">Powders</label><input id="powdersInput" placeholder="6x Thunder / 3x Air" /></div>
+              <div class="field"><label for="abilityTreeInput">Ability Tree</label><input id="abilityTreeInput" placeholder="ritualist / totem sustain" /></div>
+              <div class="field"><label for="tomesInput">Tomes</label><input id="tomesInput" placeholder="raid tome" /></div>
+              <div class="field"><label for="strInput">STR</label><input id="strInput" type="number" value="0" min="0"></div>
+              <div class="field"><label for="dexInput">DEX</label><input id="dexInput" type="number" value="0" min="0"></div>
+              <div class="field"><label for="intInput">INT</label><input id="intInput" type="number" value="0" min="0"></div>
+              <div class="field"><label for="defInput">DEF</label><input id="defInput" type="number" value="0" min="0"></div>
+              <div class="field"><label for="agiInput">AGI</label><input id="agiInput" type="number" value="0" min="0"></div>
+              <div class="field" style="grid-column:1/-1;"><label for="notesInput">Notes</label><textarea id="notesInput"></textarea></div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section id="analysis">
+      <div class="container">
+        <div class="panel card panel-strong" style="padding:20px;">
+          <div class="analysis-grid">
+            <div class="analysis-box"><div class="analysis-kicker">Damage</div><div class="analysis-value" id="damageScore">0.0</div><div class="analysis-desc">STR/DEX + goal/archetype</div></div>
+            <div class="analysis-box"><div class="analysis-kicker">Sustain</div><div class="analysis-value" id="sustainScore">0.0</div><div class="analysis-desc">INT + spell bias</div></div>
+            <div class="analysis-box"><div class="analysis-kicker">Defense</div><div class="analysis-value" id="defenseScore">0.0</div><div class="analysis-desc">DEF/AGI + raid bias</div></div>
+            <div class="analysis-box"><div class="analysis-kicker">Stability</div><div class="analysis-value" id="stabilityScore">0.0</div><div class="analysis-desc">Balance + budget</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="recommendations">
+      <div class="container">
+        <div class="alerts" id="alerts" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container">
+        <div class="panel panel-strong" style="padding:24px; text-align:center;">
+          <div class="eyebrow">Final Command</div>
+          <h2 style="margin:0 0 10px; text-transform:uppercase;">Return to Top Works Now</h2>
+          <div class="btn-row" style="justify-content:center; margin:0;">
+            <a href="#top" class="btn">Return to Top</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="jsonModalBackdrop" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle" style="display:none;"></div>
+
+  <script>
+    const APP_VERSION = "2026-03-24";
+    const STORAGE_KEY = "wynnbuild:v1";
+    const SHARE_PARAM = "b";
+
+    const fields = {
+      class: document.getElementById("classSelect"),
+      archetype: document.getElementById("archetypeSelect"),
+      level: document.getElementById("levelInput"),
+      goal: document.getElementById("goalSelect"),
+      weapon: document.getElementById("weaponInput"),
+      powders: document.getElementById("powdersInput"),
+      abilityTree: document.getElementById("abilityTreeInput"),
+      tomes: document.getElementById("tomesInput"),
+      str: document.getElementById("strInput"),
+      dex: document.getElementById("dexInput"),
+      int: document.getElementById("intInput"),
+      def: document.getElementById("defInput"),
+      agi: document.getElementById("agiInput"),
+      notes: document.getElementById("notesInput"),
+    };
+
+    const outputs = {
+      autosaveStatus: document.getElementById("autosaveStatus"),
+      previewClass: document.getElementById("previewClass"),
+      previewArchetype: document.getElementById("previewArchetype"),
+      previewWeapon: document.getElementById("previewWeapon"),
+      previewLevel: document.getElementById("previewLevel"),
+      previewGoal: document.getElementById("previewGoal"),
+      previewBudget: document.getElementById("previewBudget"),
+      damageScore: document.getElementById("damageScore"),
+      sustainScore: document.getElementById("sustainScore"),
+      defenseScore: document.getElementById("defenseScore"),
+      stabilityScore: document.getElementById("stabilityScore"),
+      alerts: document.getElementById("alerts"),
+    };
+
+    const btnCopyShare = document.getElementById("btnCopyShare");
+    const btnOpenJson = document.getElementById("btnOpenJson");
+    const btnLoadExample = document.getElementById("btnLoadExample");
+    const btnReset = document.getElementById("btnReset");
+
+    function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+    function toNum(v){ const n = Number(v); return Number.isFinite(n) ? n : 0; }
+
+    function getBudget(level){
+      const lvl = clamp(toNum(level), 1, 105);
+      return 100 + Math.round(lvl * 3.0) + (lvl >= 100 ? 25 : 0);
+    }
+
+    function getSpent(){
+      return (toNum(fields.str.value)||0)+(toNum(fields.dex.value)||0)+(toNum(fields.int.value)||0)+(toNum(fields.def.value)||0)+(toNum(fields.agi.value)||0);
+    }
+
+    function getRemaining(){
+      const budget = getBudget(fields.level.value);
+      const spent = getSpent();
+      return { budget, spent, remaining: budget - spent };
+    }
+
+    function calcScores(){
+      const str=toNum(fields.str.value), dex=toNum(fields.dex.value), intel=toNum(fields.int.value), def=toNum(fields.def.value), agi=toNum(fields.agi.value);
+      const { remaining, budget } = getRemaining();
+      const N=(x)=>clamp(x/150,0,1);
+      let dmg = 4.9 + N(str)*2.8 + N(dex)*2.8;
+      let sus = 4.9 + N(intel)*3.2;
+      let tank= 4.9 + N(def)*2.6 + N(agi)*2.2;
+
+      if(fields.goal.value==="Raid Ready") tank += 1.6;
+      if(fields.goal.value==="Maximum DPS") dmg += 1.6;
+      if(fields.goal.value==="Spell Efficiency") sus += 1.7;
+
+      if(fields.archetype.value==="High DPS + Sustain"){ dmg += 0.9; sus += 0.9; }
+      if(fields.archetype.value==="Raid Survival") tank += 1.3;
+
+      const overspent = Math.max(0, -remaining);
+      const penalty = clamp((overspent/Math.max(1,budget))*8, 0, 2.4);
+      dmg -= penalty*0.5; sus -= penalty*0.6; tank -= penalty*0.7;
+
+      dmg=clamp(dmg,1,10); sus=clamp(sus,1,10); tank=clamp(tank,1,10);
+      const avg=(dmg+sus+tank)/3;
+      const spread=Math.max(dmg,sus,tank)-Math.min(dmg,sus,tank);
+      const stability=clamp(avg - spread*0.35 - penalty*0.8, 1, 10);
+      return { dmg, sus, tank, stability, remaining };
+    }
+
+    function setAlerts(scores){
+      const items=[];
+      if(scores.remaining < 0) items.push({type:"danger", title:"Point Budget Exceeded", text:`Reduce skill points by ${Math.abs(scores.remaining)}.`});
+      else items.push({type:"good", title:"Point Budget OK", text:`Remaining points: ${scores.remaining}.`});
+
+      if(!fields.weapon.value.trim()) items.push({type:"warn", title:"Weapon Missing", text:"Pick a weapon identity first."});
+      if(!fields.abilityTree.value.trim()) items.push({type:"warn", title:"Ability Tree Missing", text:"Add an ability tree direction."});
+
+      outputs.alerts.innerHTML = items.map(x=>`<div class="alert panel"><div class="pill ${x.type}">${x.type==="danger"?"Warning":x.type==="warn"?"Alert":"Confirmed"}</div><div><h4 style="margin:0 0 6px; text-transform:uppercase; letter-spacing:.06em;">${x.title}</h4><p style="margin:0;">${x.text}</p></div></div>`).join("");
+    }
+
+    function update(){
+      outputs.previewClass.textContent = fields.class.value;
+      outputs.previewArchetype.textContent = fields.archetype.value;
+      outputs.previewWeapon.textContent = fields.weapon.value.trim() || "Not set";
+      outputs.previewLevel.textContent = fields.level.value;
+      outputs.previewGoal.textContent = fields.goal.value;
+
+      const r = getRemaining();
+      outputs.previewBudget.textContent = `Remaining: ${r.remaining}`;
+
+      const s = calcScores();
+      outputs.damageScore.textContent = s.dmg.toFixed(1);
+      outputs.sustainScore.textContent = s.sus.toFixed(1);
+      outputs.defenseScore.textContent = s.tank.toFixed(1);
+      outputs.stabilityScore.textContent = s.stability.toFixed(1);
+
+      setAlerts(s);
+
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(getBuildState()));
+      outputs.autosaveStatus.textContent = "Autosave: Saved";
+      setTimeout(()=>outputs.autosaveStatus.textContent="Autosave: Ready", 600);
+    }
+
+    function getBuildState(){
+      return {
+        v: APP_VERSION,
+        class: fields.class.value,
+        archetype: fields.archetype.value,
+        level: clamp(toNum(fields.level.value),1,105),
+        goal: fields.goal.value,
+        weapon: fields.weapon.value,
+        powders: fields.powders.value,
+        abilityTree: fields.abilityTree.value,
+        tomes: fields.tomes.value,
+        str: toNum(fields.str.value),
+        dex: toNum(fields.dex.value),
+        int: toNum(fields.int.value),
+        def: toNum(fields.def.value),
+        agi: toNum(fields.agi.value),
+        notes: fields.notes.value,
+      };
+    }
+
+    function setBuildState(state){
+      if(!state) return;
+      for(const k of Object.keys(state)){
+        if(fields[k]) fields[k].value = state[k];
+      }
+    }
+
+    function load(){
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if(raw){
+        try { setBuildState(JSON.parse(raw)); } catch {}
+      }
+    }
+
+    btnReset.addEventListener("click", ()=>{
+      localStorage.removeItem(STORAGE_KEY);
+      location.reload();
+    });
+
+    btnLoadExample.addEventListener("click", ()=>{
+      setBuildState({class:"Shaman", archetype:"High DPS + Sustain", level:105, goal:"Raid Ready", weapon:"Absolution Relik", powders:"6x Thunder / 3x Air", abilityTree:"Ritualist", tomes:"raid tome", str:40, dex:70, int:140, def:80, agi:50, notes:"Example"});
+      update();
+    });
+
+    btnCopyShare.addEventListener("click", async ()=>{
+      const url = new URL(location.href);
+      url.searchParams.set(SHARE_PARAM, btoa(JSON.stringify(getBuildState())));
+      const ok = await (navigator.clipboard?.writeText(url.toString()).then(()=>true).catch(()=>false));
+      outputs.autosaveStatus.textContent = ok ? "Share: Copied" : "Share: Failed";
+      setTimeout(()=>outputs.autosaveStatus.textContent="Autosave: Ready", 900);
+    });
+
+    btnOpenJson.addEventListener("click", ()=>{
+      alert("JSON modal will be added in next commit to keep this commit size safe.");
+    });
+
+    Object.values(fields).forEach(el=>{
+      el.addEventListener("input", update);
+      el.addEventListener("change", update);
+    });
+
+    (function boot(){
+      // load from share param if present (simple btoa)
+      const url = new URL(location.href);
+      const b = url.searchParams.get(SHARE_PARAM);
+      if(b){
+        try { setBuildState(JSON.parse(atob(b))); } catch { load(); }
+      } else {
+        load();
+      }
+      update();
+    })();
+  </script>
+</body>
+</html> 
