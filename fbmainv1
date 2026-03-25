@@ -1,0 +1,1154 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+WYNN_API_BASE = os.getenv("WYNN_API_BASE", "https://api.wynncraft.com/v3")
+HTML_PATH = os.getenv(
+    "FRONTEND_HTML_PATH",
+    os.path.join("web", "wynncraft_build_system_guided_upgrade.html")
+)
+
+TTL_ABILITY = int(os.getenv("TTL_ABILITY", "86400"))       # 24h
+TTL_ITEM_DB = int(os.getenv("TTL_ITEM_DB", "86400"))       # 24h
+TTL_METADATA = int(os.getenv("TTL_METADATA", "86400"))     # 24h
+TTL_WB_DATA = int(os.getenv("TTL_WB_DATA", "86400"))       # 24h
+
+ATTACK_SPEED_MULT_SPELL: Dict[str, float] = {
+    "superFast": 4.3,
+    "veryFast": 3.1,
+    "fast": 2.5,
+    "normal": 2.05,
+    "slow": 1.5,
+    "verySlow": 0.83,
+    "superSlow": 0.51,
+}
+
+SPELL_MULT_PCT: Dict[str, float] = {
+    "aura_center": 200.0,
+    "totem_smash": 100.0,
+    "totem_tick": 20.0,
+    "haul": 100.0,
+    "uproot": 100.0,
+}
+
+SPELL_CONVERSIONS: Dict[str, Dict[str, float]] = {}
+
+ROLL_DISCRETE_INTEGERS = True
+TAG_RE = re.compile(r"<[^>]+>")
+
+# WynnBuilder base64 alphabet (non-standard) – defined in their utils.js
+# (we hardcode it to match)
+WB_B64 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"
+
+# Version map from WynnBuilder's js/load_item.js:wynn_version_names :contentReference[oaicite:4]{index=4}
+WYNN_VERSION_NAMES: List[str] = [
+    "2.0.1.1","2.0.1.2","2.0.2.1","2.0.2.3","2.0.3.1","2.0.4.1","2.0.4.3","2.0.4.4",
+    "2.1.0.0","2.1.0.1","2.1.1.0","2.1.1.1","2.1.1.2","2.1.1.3","2.1.1.4","2.1.1.5",
+    "2.1.1.6","2.1.1.7","2.1.2.0","2.1.3.0","2.1.3.4","2.1.4.0","2.1.5.0","2.1.6.0",
+]
+WYNN_VERSION_LATEST = len(WYNN_VERSION_NAMES) - 1
+
+# Equipment order used by builder (weapon last) :contentReference[oaicite:5]{index=5}
+EQUIP_SLOTS = ["helmet","chestplate","leggings","boots","ring1","ring2","bracelet","necklace","weapon"]
+
+# =============================================================================
+# TTL CACHE
+# =============================================================================
+
+class TTLCache:
+    def __init__(self) -> None:
+        self._store: Dict[str, Tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Optional[Any]:
+        v = self._store.get(key)
+        if not v:
+            return None
+        exp, data = v
+        if time.time() > exp:
+            self._store.pop(key, None)
+            return None
+        return data
+
+    def set(self, key: str, ttl_s: int, data: Any) -> None:
+        self._store[key] = (time.time() + ttl_s, data)
+
+CACHE = TTLCache()
+
+ITEM_INDEX: Dict[str, Dict[str, Any]] = {}
+ITEMS_LIST: List[Dict[str, Any]] = []
+
+# =============================================================================
+# HTTP HELPERS
+# =============================================================================
+
+async def fetch_json(url: str) -> Any:
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(url, headers={"Accept": "application/json"})
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Upstream failed {r.status_code}: {url}")
+        return r.json()
+
+# =============================================================================
+# WYNN API (CACHED)
+# =============================================================================
+
+async def get_item_database(full_result: bool = True) -> Any:
+    key = f"item_db:{'full' if full_result else 'paged'}"
+    cached = CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    url = f"{WYNN_API_BASE}/item/database"
+    if full_result:
+        url += "?fullResult"
+
+    data = await fetch_json(url)
+    CACHE.set(key, TTL_ITEM_DB, data)
+    return data
+
+async def get_item_metadata() -> Any:
+    key = "item_metadata"
+    cached = CACHE.get(key)
+    if cached is not None:
+        return cached
+    data = await fetch_json(f"{WYNN_API_BASE}/item/metadata")
+    CACHE.set(key, TTL_METADATA, data)
+    return data
+
+async def quick_search_item(query: str) -> Any:
+    return await fetch_json(f"{WYNN_API_BASE}/item/search/{query}")
+
+async def get_ability_tree(tree: str) -> Any:
+    key = f"ability_tree:{tree.lower()}"
+    cached = CACHE.get(key)
+    if cached is not None:
+        return cached
+    data = await fetch_json(f"{WYNN_API_BASE}/ability/tree/{tree}")
+    CACHE.set(key, TTL_ABILITY, data)
+    return data
+
+async def get_ability_map(tree: str) -> Any:
+    key = f"ability_map:{tree.lower()}"
+    cached = CACHE.get(key)
+    if cached is not None:
+        return cached
+    data = await fetch_json(f"{WYNN_API_BASE}/ability/map/{tree}")
+    CACHE.set(key, TTL_ABILITY, data)
+    return data
+
+async def get_aspects_api(tree: str) -> Any:
+    key = f"aspects_api:{tree.lower()}"
+    cached = CACHE.get(key)
+    if cached is not None:
+        return cached
+    data = await fetch_json(f"{WYNN_API_BASE}/aspects/{tree}")
+    CACHE.set(key, TTL_ABILITY, data)
+    return data
+
+# =============================================================================
+# ITEM DB NORMALIZATION
+# =============================================================================
+
+def _parse_db_to_list(db: Any) -> List[Dict[str, Any]]:
+    if isinstance(db, list):
+        return [x for x in db if isinstance(x, dict)]
+    if isinstance(db, dict):
+        if isinstance(db.get("items"), list):
+            return [x for x in db["items"] if isinstance(x, dict)]
+        data = db.get("data")
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            return [x for x in data["items"] if isinstance(x, dict)]
+        vals = [v for v in db.values() if isinstance(v, dict)]
+        if vals:
+            return vals
+    return []
+
+def normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
+    name = raw.get("name") or raw.get("internalName") or raw.get("displayName") or "Unknown"
+    it_type = str(raw.get("type") or "").lower()
+    reqs = raw.get("requirements") or {}
+    lvl = int(reqs.get("level") or raw.get("level") or 0)
+    class_req = reqs.get("classRequirement")
+    ids = raw.get("identifications") or {}
+    base = raw.get("base") or {}
+    avg_dps = raw.get("averageDps")
+    return {
+        "name": str(name),
+        "type": it_type,
+        "attackSpeed": raw.get("attackSpeed"),
+        "level": lvl,
+        "classRequirement": class_req,
+        "identifications": ids,
+        "base": base,
+        "averageDps": avg_dps,
+        "rarity": raw.get("rarity") or raw.get("tier"),
+        "raw": raw,
+    }
+
+async def ensure_item_index() -> None:
+    global ITEM_INDEX, ITEMS_LIST
+    if ITEMS_LIST and ITEM_INDEX:
+        return
+    db = await get_item_database(full_result=True)
+    arr = _parse_db_to_list(db)
+    items = [normalize_item(x) for x in arr]
+    idx = {it["name"].lower(): it for it in items if it.get("name")}
+    ITEMS_LIST = items
+    ITEM_INDEX = idx
+
+def find_item_by_name(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not name:
+        return None
+    return ITEM_INDEX.get(name.lower())
+
+# =============================================================================
+# RNG OVERRIDES
+# =============================================================================
+
+def as_minmax(v: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(v, (int, float)):
+        x = float(v)
+        return x, x
+    if isinstance(v, dict):
+        if "min" in v and "max" in v:
+            return float(v["min"]), float(v["max"])
+        if "value" in v:
+            x = float(v["value"])
+            return x, x
+        if "raw" in v:
+            x = float(v["raw"])
+            return x, x
+    return None
+
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def interp(minv: float, maxv: float, pct: float) -> float:
+    p = clamp(float(pct), 0.0, 100.0) / 100.0
+    return minv + (maxv - minv) * p
+
+def sample_id_value(v: Any, rng: random.Random) -> float:
+    mm = as_minmax(v)
+    if not mm:
+        return 0.0
+    a, b = mm
+    if a == b:
+        return a
+    if ROLL_DISCRETE_INTEGERS:
+        lo = math.floor(min(a, b))
+        hi = math.floor(max(a, b))
+        if hi <= lo:
+            return float(lo)
+        return float(rng.randint(lo, hi))
+    return float(rng.uniform(a, b))
+
+def resolve_ids(ids: Dict[str, Any], rng: random.Random, overrides: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    roll_pct = overrides.get("_rollPct", None)
+    for k, v in (ids or {}).items():
+        if k in overrides:
+            try:
+                out[k] = float(overrides[k])
+                continue
+            except Exception:
+                pass
+        mm = as_minmax(v)
+        if mm and roll_pct is not None:
+            a, b = mm
+            out[k] = float(interp(a, b, float(roll_pct)))
+        else:
+            out[k] = float(sample_id_value(v, rng))
+    return out
+
+# =============================================================================
+# SIMPLE DAMAGE BACKBONE (same as before)
+# =============================================================================
+
+class ElemDam:
+    __slots__ = ("nmin","nmax","emin","emax","tmin","tmax","wmin","wmax","fmin","fmax","amin","amax")
+    def __init__(self, nmin=0.0,nmax=0.0, emin=0.0,emax=0.0, tmin=0.0,tmax=0.0,
+                 wmin=0.0,wmax=0.0, fmin=0.0,fmax=0.0, amin=0.0,amax=0.0):
+        self.nmin=nmin; self.nmax=nmax
+        self.emin=emin; self.emax=emax
+        self.tmin=tmin; self.tmax=tmax
+        self.wmin=wmin; self.wmax=wmax
+        self.fmin=fmin; self.fmax=fmax
+        self.amin=amin; self.amax=amax
+
+def convert_and_floor(neutral_base: float, neutral: float, pct: float) -> Tuple[float, float]:
+    convert = min(neutral, neutral_base * pct)
+    elemental = float(int(math.floor(convert)))
+    new_neutral = float(int(math.floor(neutral - convert)))
+    return new_neutral, elemental
+
+def apply_spell_conversions(d: ElemDam, spell_key: str) -> ElemDam:
+    conv = SPELL_CONVERSIONS.get(spell_key, {})
+    if not conv:
+        return d
+    baseN_min, curN_min = d.nmin, d.nmin
+    emin,tmin,wmin,fmin,amin = d.emin,d.tmin,d.wmin,d.fmin,d.amin
+    for el, pct in conv.items():
+        curN_min, amt = convert_and_floor(baseN_min, curN_min, float(pct))
+        if el == "earth": emin += amt
+        elif el == "thunder": tmin += amt
+        elif el == "water": wmin += amt
+        elif el == "fire": fmin += amt
+        elif el == "air": amin += amt
+    baseN_max, curN_max = d.nmax, d.nmax
+    emax,tmax,wmax,fmax,amax = d.emax,d.tmax,d.wmax,d.fmax,d.amax
+    for el, pct in conv.items():
+        curN_max, amt = convert_and_floor(baseN_max, curN_max, float(pct))
+        if el == "earth": emax += amt
+        elif el == "thunder": tmax += amt
+        elif el == "water": wmax += amt
+        elif el == "fire": fmax += amt
+        elif el == "air": amax += amt
+    return ElemDam(curN_min, curN_max, emin, emax, tmin, tmax, wmin, wmax, fmin, fmax, amin, amax)
+
+def apply_id_bonuses_spell(d: ElemDam, boosts_pct: Dict[str, float]) -> ElemDam:
+    spell_pct = float(boosts_pct.get("spell", 0.0))
+    str_pct = float(boosts_pct.get("strength", 0.0))
+    def mult(total_pct: float) -> float:
+        total_pct = max(-100.0, total_pct)
+        return 1.0 + total_pct / 100.0
+    mN = mult(str_pct + spell_pct)
+    def mEl(key: str) -> float:
+        return mult(str_pct + spell_pct + float(boosts_pct.get(key, 0.0)))
+    return ElemDam(
+        d.nmin*mN, d.nmax*mN,
+        d.emin*mEl("earth"), d.emax*mEl("earth"),
+        d.tmin*mEl("thunder"), d.tmax*mEl("thunder"),
+        d.wmin*mEl("water"), d.wmax*mEl("water"),
+        d.fmin*mEl("fire"), d.fmax*mEl("fire"),
+        d.amin*mEl("air"), d.amax*mEl("air"),
+    )
+
+def apply_attack_speed_mult_spell(d: ElemDam, attack_speed: str) -> ElemDam:
+    m = ATTACK_SPEED_MULT_SPELL.get(attack_speed, 2.05)
+    return ElemDam(
+        d.nmin*m, d.nmax*m,
+        d.emin*m, d.emax*m,
+        d.tmin*m, d.tmax*m,
+        d.wmin*m, d.wmax*m,
+        d.fmin*m, d.fmax*m,
+        d.amin*m, d.amax*m,
+    )
+
+def apply_raw_spell(d: ElemDam, raw_spell: float) -> ElemDam:
+    nmin = d.nmin + raw_spell
+    nmax = d.nmax + raw_spell
+    total_min = nmin + d.emin + d.tmin + d.wmin + d.fmin + d.amin
+    total_max = nmax + d.emax + d.tmax + d.wmax + d.fmax + d.amax
+    if total_min < 0 or total_max < 0:
+        return ElemDam()
+    return ElemDam(nmin, nmax, d.emin, d.emax, d.tmin, d.tmax, d.wmin, d.wmax, d.fmin, d.fmax, d.amin, d.amax)
+
+def apply_spell_multiplier(d: ElemDam, spell_key: str) -> ElemDam:
+    pct = SPELL_MULT_PCT.get(spell_key, 100.0)
+    m = pct / 100.0
+    return ElemDam(
+        d.nmin*m, d.nmax*m,
+        d.emin*m, d.emax*m,
+        d.tmin*m, d.tmax*m,
+        d.wmin*m, d.wmax*m,
+        d.fmin*m, d.fmax*m,
+        d.amin*m, d.amax*m,
+    )
+
+def total_damage(d: ElemDam) -> Tuple[float,float]:
+    mn = d.nmin + d.emin + d.tmin + d.wmin + d.fmin + d.amin
+    mx = d.nmax + d.emax + d.tmax + d.wmax + d.fmax + d.amax
+    return mn, mx
+
+def parse_weapon_base(item: Dict[str, Any]) -> ElemDam:
+    base = item.get("base") or {}
+    def mm(key: str) -> Tuple[float,float]:
+        v = base.get(key)
+        if isinstance(v, dict) and "min" in v and "max" in v:
+            return float(v["min"]), float(v["max"])
+        return 0.0, 0.0
+    nmn,nmx = mm("baseNeutralDamage")
+    emn,emx = mm("baseEarthDamage")
+    tmn,tmx = mm("baseThunderDamage")
+    wmn,wmx = mm("baseWaterDamage")
+    fmn,fmx = mm("baseFireDamage")
+    amn,amx = mm("baseAirDamage")
+    return ElemDam(nmn,nmx, emn,emx, tmn,tmx, wmn,wmx, fmn,fmx, amn,amx)
+
+# =============================================================================
+# ENGINE DPS (#1)
+# =============================================================================
+
+def strip_html(s: str) -> str:
+    return TAG_RE.sub("", s).replace("\u00a0", " ").strip()
+
+def flatten_nodes(tree_json: dict) -> Dict[str, dict]:
+    out = {}
+    pages = tree_json.get("pages") or {}
+    for _, page_nodes in pages.items():
+        if isinstance(page_nodes, dict):
+            for node_id, node in page_nodes.items():
+                out[node_id] = node
+    return out
+
+def parse_total_damage_pct(text: str) -> Optional[float]:
+    m = re.search(r"Total Damage:\s*([+-]?\d+(?:\.\d+)?)\s*%\s*\(of your DPS\)", text)
+    return float(m.group(1)) if m else None
+
+def parse_every_seconds_to_hps(text: str) -> Optional[float]:
+    m = re.search(r"every\s*([0-9.]+)s", text)
+    if not m:
+        return None
+    interval = float(m.group(1))
+    return (1.0 / interval) if interval > 0 else None
+
+def parse_max_count(text: str, default: int) -> int:
+    m = re.search(r"Max\s*([0-9]+)", text)
+    return int(m.group(1)) if m else default
+
+def weapon_dps_reference(weapon_item: Dict[str, Any]) -> float:
+    raw = weapon_item.get("raw") or {}
+    v = raw.get("averageDps", weapon_item.get("averageDps", 0))
+    try:
+        return float(v or 0.0)
+    except Exception:
+        return 0.0
+
+def compute_engine_dps(tree_json: dict, selected_nodes: List[str], weapon_ref_dps: float, knobs: Dict[str, Any]) -> Dict[str, Any]:
+    sel = set(selected_nodes)
+    nodes = flatten_nodes(tree_json)
+
+    def node_text(nid: str) -> str:
+        node = nodes.get(nid) or {}
+        desc = node.get("description") or []
+        return " ".join(strip_html(x) for x in desc)
+
+    engines: Dict[str, Any] = {}
+    total = 0.0
+
+    if "puppetMaster" in sel and "puppetMaster" in nodes:
+        txt = node_text("puppetMaster")
+        td = parse_total_damage_pct(txt) or 0.0
+        hps = parse_every_seconds_to_hps(txt) or 0.0
+        max_p = parse_max_count(txt, 3)
+        if "morePuppets" in sel: max_p += 1
+        if "morePuppets2" in sel: max_p += 2
+        uptime = float(knobs.get("puppet_uptime", 1.0))
+        dps = (weapon_ref_dps * (td/100.0)) * hps * max_p * uptime
+        engines["puppets"] = {"dps": dps, "totalDamagePct": td, "hitsPerSecond": hps, "count": max_p, "uptime": uptime}
+        total += dps
+
+    if "jungleSlayer" in sel and "jungleSlayer" in nodes:
+        txt = node_text("jungleSlayer")
+        td = parse_total_damage_pct(txt) or 0.0
+        hps = parse_every_seconds_to_hps(txt) or 0.0
+        active_totems = max(1, int(knobs.get("active_totems", 1)))
+        effigy_mult = 0.8 ** (active_totems - 1)
+        uptime = float(knobs.get("effigy_uptime", 1.0))
+        dps = (weapon_ref_dps * (td/100.0)) * hps * active_totems * uptime * effigy_mult
+        engines["effigy"] = {"dps": dps, "totalDamagePct": td, "hitsPerSecond": hps, "count": active_totems, "uptime": uptime, "multiplier": effigy_mult}
+        total += dps
+
+    if "hummingbirds" in sel and "hummingbirds" in nodes:
+        txt = node_text("hummingbirds")
+        td = parse_total_damage_pct(txt) or 0.0
+        hps = parse_every_seconds_to_hps(txt) or 0.0
+        count = 2
+        uptime = float(knobs.get("hummingbird_uptime", 1.0))
+        dps = (weapon_ref_dps * (td/100.0)) * hps * count * uptime
+        engines["hummingbirds"] = {"dps": dps, "totalDamagePct": td, "hitsPerSecond": hps, "count": count, "uptime": uptime}
+        total += dps
+
+    return {"engines": engines, "total_engine_dps": total}
+
+# =============================================================================
+# WYNNBUILDER GENERIC IMPORT (BINARY)
+# =============================================================================
+
+class BitCursor:
+    def __init__(self, data_chars: str):
+        # convert each char -> 6-bit value, then store bits LSB-first
+        self.bits: List[int] = []
+        table = {ch: i for i, ch in enumerate(WB_B64)}
+        for ch in data_chars:
+            if ch not in table:
+                raise HTTPException(400, f"Invalid character in hash: {ch!r}")
+            v = table[ch]
+            for k in range(6):
+                self.bits.append((v >> k) & 1)  # LSB-first
+        self.i = 0
+
+    def read_u(self, nbits: int) -> int:
+        if self.i + nbits > len(self.bits):
+            raise HTTPException(400, "Hash ended early (not enough bits)")
+        val = 0
+        for k in range(nbits):
+            val |= (self.bits[self.i + k] << k)  # LSB-first integer
+        self.i += nbits
+        return val
+
+    def read_s_twos(self, nbits: int) -> int:
+        u = self.read_u(nbits)
+        sign_bit = 1 << (nbits - 1)
+        if u & sign_bit:
+            u = u - (1 << nbits)
+        return int(u)
+
+    def remaining_bits(self) -> int:
+        return len(self.bits) - self.i
+
+async def wb_get_version_data(version_str: str) -> Dict[str, Any]:
+    """
+    Loads:
+      /data/<version>/encoding_consts.json
+      /data/<version>/items.json
+      /data/<version>/tomes.json
+      /data/<version>/aspects.json
+    from the wynnbuilder hosted site (same content as GitHub data folder). :contentReference[oaicite:6]{index=6}
+    """
+    cache_key = f"wbdata:{version_str}"
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    base = f"https://wynnbuilder.github.io/data/{version_str}"
+    enc = await fetch_json(f"{base}/encoding_consts.json")
+    items = await fetch_json(f"{base}/items.json")
+    tomes = await fetch_json(f"{base}/tomes.json")
+    aspects = await fetch_json(f"{base}/aspects.json")
+
+    # Build id->name maps
+    id_to_item: Dict[int, str] = {}
+    for it in items:
+        # items.json has "id" and "displayName"/"name" in this repo’s data
+        iid = it.get("id")
+        if iid is None:
+            continue
+        nm = it.get("displayName") or it.get("name")
+        if nm:
+            id_to_item[int(iid)] = str(nm)
+
+    id_to_tome: Dict[int, str] = {}
+    for t in tomes:
+        tid = t.get("id")
+        nm = t.get("name") or t.get("displayName")
+        if tid is not None and nm:
+            id_to_tome[int(tid)] = str(nm)
+
+    id_to_aspect: Dict[int, str] = {}
+    for a in aspects:
+        aid = a.get("id")
+        nm = a.get("name") or a.get("displayName")
+        if aid is not None and nm:
+            id_to_aspect[int(aid)] = str(nm)
+
+    out = {"ENC": enc, "id_to_item": id_to_item, "id_to_tome": id_to_tome, "id_to_aspect": id_to_aspect}
+    CACHE.set(cache_key, TTL_WB_DATA, out)
+    return out
+
+def decode_powders(cur: BitCursor, ENC: dict) -> List[str]:
+    """
+    Implements powder decoding per spec summary in ENCODING.md. :contentReference[oaicite:7]{index=7}
+    Returns powder strings like "E6", "T4".
+    """
+    elements: List[str] = ENC["POWDER_ELEMENTS"]
+    tiers: int = int(ENC["POWDER_TIERS"])
+    pid_bits: int = int(ENC["POWDER_ID_BITLEN"])
+    wrap_bits: int = int(ENC["POWDER_WRAPPER_BITLEN"])
+
+    rep_bit = int(ENC["POWDER_REPEAT_OP"]["BITLEN"])
+    rep_tier_bit = int(ENC["POWDER_REPEAT_TIER_OP"]["BITLEN"])
+    change_bit = int(ENC["POWDER_CHANGE_OP"]["BITLEN"])
+
+    # first powder id
+    pid = cur.read_u(pid_bits)
+    out: List[Tuple[int, int]] = []  # (element_idx, tier1based)
+    el = pid // tiers
+    tier = (pid % tiers) + 1
+    out.append((el, tier))
+
+    while True:
+        repeat_flag = cur.read_u(rep_bit)  # 0 repeat, 1 no_repeat
+        if repeat_flag == ENC["POWDER_REPEAT_OP"]["REPEAT"]:
+            out.append((el, tier))
+            continue
+
+        # NO_REPEAT
+        tierop = cur.read_u(rep_tier_bit)  # 0 repeat_tier, 1 change_powder
+        if tierop == ENC["POWDER_REPEAT_TIER_OP"]["REPEAT_TIER"]:
+            wrap = cur.read_u(wrap_bits)
+            # element_wrap is encoded as ((next - curr) % NUM_ELEM) - 1
+            # so next = (curr + wrap + 1) % NUM_ELEM
+            el = (el + wrap + 1) % len(elements)
+            out.append((el, tier))
+        else:
+            # CHANGE_POWDER -> either NEW_POWDER or NEW_ITEM
+            ch = cur.read_u(change_bit)
+            if ch == ENC["POWDER_CHANGE_OP"]["NEW_ITEM"]:
+                break
+            # NEW_POWDER: read a new pid
+            pid = cur.read_u(pid_bits)
+            el = pid // tiers
+            tier = (pid % tiers) + 1
+            out.append((el, tier))
+
+    # Convert to "E6" etc
+    return [f"{elements[e]}{t}" for (e, t) in out]
+
+async def decode_wynnbuilder_hash(hash_str: str) -> Dict[str, Any]:
+    """
+    Binary decoding:
+      first 6 bits: legacy selector (must be > 11 to be binary) :contentReference[oaicite:8]{index=8}
+      next 10 bits: version id -> wynn_version_names :contentReference[oaicite:9]{index=9}
+      then parse using encoding_consts.json :contentReference[oaicite:10]{index=10}
+    """
+    cur = BitCursor(hash_str)
+
+    legacy = cur.read_u(6)
+    if legacy <= 11:
+        raise HTTPException(400, "This is a legacy WynnBuilder link (old format). Binary import supports modern links; legacy can be added later.")
+
+    version_id = cur.read_u(10)
+    if version_id < 0 or version_id >= len(WYNN_VERSION_NAMES):
+        # fallback to latest
+        version_id = WYNN_VERSION_LATEST
+    version_str = WYNN_VERSION_NAMES[version_id]
+
+    vdata = await wb_get_version_data(version_str)
+    ENC = vdata["ENC"]
+    id_to_item = vdata["id_to_item"]
+    id_to_tome = vdata["id_to_tome"]
+    id_to_aspect = vdata["id_to_aspect"]
+
+    # Equipment
+    equip_kind_bits = int(ENC["EQUIPMENT_KIND"]["BITLEN"])
+    item_id_bits = int(ENC["ITEM_ID_BITLEN"])
+    powders_flag_bits = int(ENC["EQUIPMENT_POWDERS_FLAG"]["BITLEN"])
+    equip_num = int(ENC["EQUIPMENT_NUM"])
+    powderable_num = int(ENC["POWDERABLE_EQUIPMENT_NUM"])
+
+    equipment_ids: List[int] = []
+    equipment_powders: List[List[str]] = [[] for _ in range(equip_num)]
+
+    for i in range(equip_num):
+        kind = cur.read_u(equip_kind_bits)
+        if kind != ENC["EQUIPMENT_KIND"]["NORMAL"]:
+            raise HTTPException(400, "This build uses crafted/custom items. Importer currently supports NORMAL items only (most builds).")
+
+        enc_id = cur.read_u(item_id_bits)
+        # stored as ID+1, where 0 means empty slot
+        item_id = int(enc_id) - 1
+        if item_id < 0:
+            item_id = -1
+        equipment_ids.append(item_id)
+
+        if i < powderable_num:
+            pf = cur.read_u(powders_flag_bits)
+            if pf == ENC["EQUIPMENT_POWDERS_FLAG"]["HAS_POWDERS"]:
+                equipment_powders[i] = decode_powders(cur, ENC)
+
+    # Tomes
+    tomes: List[str] = []
+    if cur.read_u(int(ENC["TOMES_FLAG"]["BITLEN"])) == ENC["TOMES_FLAG"]["HAS_TOMES"]:
+        slot_bits = int(ENC["TOME_SLOT_FLAG"]["BITLEN"])
+        tome_id_bits = int(ENC["TOME_ID_BITLEN"])
+        for _ in range(int(ENC["TOME_NUM"])):
+            used = cur.read_u(slot_bits)
+            if used == ENC["TOME_SLOT_FLAG"]["USED"]:
+                tid = cur.read_u(tome_id_bits)
+                tomes.append(id_to_tome.get(int(tid), f"Tome#{tid}"))
+
+    # Skillpoints
+    sp = {"str": None, "dex": None, "int": None, "def": None, "agi": None}
+    sp_flag = cur.read_u(int(ENC["SP_FLAG"]["BITLEN"]))
+    if sp_flag == ENC["SP_FLAG"]["ASSIGNED"]:
+        elem_flag_bits = int(ENC["SP_ELEMENT_FLAG"]["BITLEN"])
+        sp_val_bits = int(ENC["MAX_SP_BITLEN"])
+        order = ["str","dex","int","def","agi"]  # matches builder ordering
+        for key in order:
+            ef = cur.read_u(elem_flag_bits)
+            if ef == ENC["SP_ELEMENT_FLAG"]["ELEMENT_ASSIGNED"]:
+                sp[key] = cur.read_s_twos(sp_val_bits)
+            else:
+                sp[key] = None
+
+    # Level
+    lvl_flag = cur.read_u(int(ENC["LEVEL_FLAG"]["BITLEN"]))
+    if lvl_flag == ENC["LEVEL_FLAG"]["MAX"]:
+        level = int(ENC["MAX_LEVEL"])
+    else:
+        level = int(cur.read_u(int(ENC["LEVEL_BITLEN"])))
+
+    # Aspects (plus tiers)
+    aspects_out: List[Dict[str, Any]] = []
+    if cur.read_u(int(ENC["ASPECTS_FLAG"]["BITLEN"])) == ENC["ASPECTS_FLAG"]["HAS_ASPECTS"]:
+        slot_bits = int(ENC["ASPECT_SLOT_FLAG"]["BITLEN"])
+        asp_id_bits = int(ENC["ASPECT_ID_BITLEN"])
+        tier_bits = int(ENC.get("ASPECT_TIER_BITLEN", 0) or 0)
+        num_aspects = int(ENC.get("NUM_ASPECTS", 0) or 0)
+        for _ in range(num_aspects):
+            used = cur.read_u(slot_bits)
+            if used == ENC["ASPECT_SLOT_FLAG"]["USED"]:
+                aid = int(cur.read_u(asp_id_bits))
+                tier = int(cur.read_u(tier_bits)) if tier_bits > 0 else 0
+                aspects_out.append({"name": id_to_aspect.get(aid, f"Aspect#{aid}"), "tierIndex": tier})
+
+    # Ability tree blob = remaining bits
+    ability_tree_bits_remaining = cur.remaining_bits()
+
+    # Map equip IDs to names
+    loadout: Dict[str, Optional[str]] = {}
+    for slot, iid in zip(EQUIP_SLOTS, equipment_ids):
+        if iid < 0:
+            loadout[slot] = None
+        else:
+            loadout[slot] = id_to_item.get(iid, f"Item#{iid}")
+
+    return {
+        "version": version_str,
+        "level": level,
+        "loadout": loadout,
+        "powders": {slot: equipment_powders[i] for i, slot in enumerate(EQUIP_SLOTS) if i < len(equipment_powders) and equipment_powders[i]},
+        "tomes": tomes,
+        "skillpoints": sp,
+        "aspects": aspects_out,
+        "abilityTreeBitsRemaining": ability_tree_bits_remaining,
+        "note": "Imported via WynnBuilder binary encoding (normal items only). Legacy/crafted/custom can be added later."
+    }
+
+# =============================================================================
+# API MODELS
+# =============================================================================
+
+class SimPayload(BaseModel):
+    className: str = "Shaman"
+    level: int = 105
+    goal: str = "Raid Ready"
+    archetype: str = "High DPS + Sustain"
+    loadout: Dict[str, Optional[str]] = Field(default_factory=dict)
+    skillpoints: Dict[str, int] = Field(default_factory=dict)
+    selectedNodes: List[str] = Field(default_factory=list)
+    selectedAspects: Dict[str, Any] = Field(default_factory=dict)
+    itemRollOverrides: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    engineKnobs: Dict[str, Any] = Field(default_factory=dict)
+    nSamples: int = 1200
+    seed: int = 1337
+
+class MissingSlotPayload(BaseModel):
+    state: SimPayload
+    missingSlot: str
+    limit: int = 10
+
+class ImportWBRequest(BaseModel):
+    url: str
+
+# =============================================================================
+# SIM
+# =============================================================================
+
+def percentile(sorted_vals: List[float], p: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    p = clamp(p, 0.0, 1.0)
+    idx = int(round(p * (len(sorted_vals) - 1)))
+    return float(sorted_vals[idx])
+
+def gather_items_from_loadout(loadout: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for slot in EQUIP_SLOTS:
+        n = loadout.get(slot)
+        it = find_item_by_name(n)
+        if it:
+            out.append(it)
+    return out
+
+def roll_build_ids(items: List[Dict[str, Any]], overrides: Dict[str, Dict[str, Any]], rng: random.Random) -> Dict[str, float]:
+    total: Dict[str, float] = {}
+    for it in items:
+        name = it["name"]
+        ov = overrides.get(name, {})
+        rolled = resolve_ids(it.get("identifications") or {}, rng, ov)
+        for k, v in rolled.items():
+            total[k] = float(total.get(k, 0.0) + float(v))
+    return total
+
+def compute_build_stats_from_ids(ids: Dict[str, float]) -> Dict[str, Any]:
+    hp = float(ids.get("rawHealth", 0.0))
+    mana_regen = float(ids.get("manaRegen", 0.0))
+    mana_steal = float(ids.get("manaSteal", 0.0))
+    life_steal = float(ids.get("lifeSteal", 0.0))
+    heal_eff = float(ids.get("healingEfficiency", 0.0))
+    spell_cost_pct = float(ids.get("spellCost", 0.0))
+    raw_1st = float(ids.get("raw1stSpellCost", 0.0))
+    defs = {
+        "earthDefence": float(ids.get("earthDefence", 0.0)),
+        "thunderDefence": float(ids.get("thunderDefence", 0.0)),
+        "waterDefence": float(ids.get("waterDefence", 0.0)),
+        "fireDefence": float(ids.get("fireDefence", 0.0)),
+        "airDefence": float(ids.get("airDefence", 0.0)),
+    }
+    avg_def = sum(defs.values()) / max(1, len(defs))
+    ehp = hp * (1.0 + (avg_def / 200.0))
+    sustain = mana_regen * 1.4 + mana_steal * 0.9 + life_steal * 0.4 + heal_eff * 0.05 - spell_cost_pct * 0.2 + (-raw_1st) * 0.15
+    return {"effectiveHealth": ehp, "sustainScore": sustain, "spellCostPct": spell_cost_pct}
+
+def compute_spell_midpoint_damage(weapon_item: Dict[str, Any], rolled_ids: Dict[str, float], spell_key: str) -> float:
+    atkspd = weapon_item.get("attackSpeed") or "normal"
+    base = parse_weapon_base(weapon_item)
+    boosts = {
+        "strength": 0.0,
+        "spell": float(rolled_ids.get("spellDamage", 0.0)),
+        "earth": float(rolled_ids.get("earthDamage", 0.0)),
+        "thunder": float(rolled_ids.get("thunderDamage", 0.0)),
+        "water": float(rolled_ids.get("waterDamage", 0.0)),
+        "fire": float(rolled_ids.get("fireDamage", 0.0)),
+        "air": float(rolled_ids.get("airDamage", 0.0)),
+    }
+    elem_spell = float(rolled_ids.get("elementalSpellDamage", 0.0))
+    if elem_spell:
+        for k in ("earth","thunder","water","fire","air"):
+            boosts[k] += elem_spell
+    raw_spell = float(rolled_ids.get("rawSpellDamage", 0.0))
+    d = ElemDam(base.nmin, base.nmax, base.emin, base.emax, base.tmin, base.tmax, base.wmin, base.wmax, base.fmin, base.fmax, base.amin, base.amax)
+    d = apply_spell_conversions(d, spell_key)
+    d = apply_id_bonuses_spell(d, boosts)
+    d = apply_attack_speed_mult_spell(d, atkspd)
+    d = apply_raw_spell(d, raw_spell)
+    d = apply_spell_multiplier(d, spell_key)
+    mn, mx = total_damage(d)
+    return (mn + mx) / 2.0
+
+def simulate_with_tree(payload: SimPayload, tree_json: dict) -> Dict[str, Any]:
+    weapon_name = payload.loadout.get("weapon")
+    if not weapon_name:
+        raise HTTPException(400, "Missing weapon name in loadout.weapon")
+    weapon_item = find_item_by_name(weapon_name)
+    if not weapon_item:
+        raise HTTPException(404, f"Weapon not found in item DB: {weapon_name}")
+
+    items = gather_items_from_loadout(payload.loadout)
+    rng = random.Random(int(payload.seed))
+    n = max(1, int(payload.nSamples))
+
+    stat_accum: Dict[str, float] = {}
+    spell_samples: Dict[str, List[float]] = {s: [] for s in ["aura_center","totem_smash","totem_tick"]}
+
+    for _ in range(n):
+        rolled_ids = roll_build_ids(items, payload.itemRollOverrides, rng)
+        for k, v in rolled_ids.items():
+            stat_accum[k] = float(stat_accum.get(k, 0.0) + float(v))
+        for spell in spell_samples.keys():
+            spell_samples[spell].append(compute_spell_midpoint_damage(weapon_item, rolled_ids, spell))
+
+    avg_ids = {k: v / n for k, v in stat_accum.items()}
+    stats = compute_build_stats_from_ids(avg_ids)
+
+    spell_out = {}
+    for k, vals in spell_samples.items():
+        vals.sort()
+        spell_out[k] = {"p50": percentile(vals, 0.50), "mean": sum(vals)/len(vals)}
+
+    ref_dps = weapon_dps_reference(weapon_item)
+    engine = compute_engine_dps(tree_json, payload.selectedNodes, ref_dps, payload.engineKnobs)
+
+    aura_p50 = spell_out["aura_center"]["p50"]
+    total_damage = aura_p50 + float(engine["total_engine_dps"])
+
+    mana_sustain = stats["sustainScore"]
+    ehp = stats["effectiveHealth"]
+    raid_score = clamp((0.0009*total_damage + 0.00025*ehp + 0.03*mana_sustain), 0.0, 100.0)
+
+    analysis = {
+        "totalDamage": int(round(total_damage)),
+        "effectiveHealth": int(round(ehp)),
+        "manaSustain": round(mana_sustain, 1),
+        "raidViability": f"{round(raid_score, 1)}%",
+        "spellDamage": int(round(aura_p50)),
+        "meleeDamage": 0,
+        "spellCost": round(stats["spellCostPct"], 1),
+        "damageScore": round(total_damage/1000.0, 2),
+        "sustainScore": round(mana_sustain/10.0, 2),
+        "defenseScore": round(ehp/5000.0, 2),
+        "stabilityScore": round((total_damage/1000.0 + mana_sustain/10.0 + ehp/5000.0)/3.0, 2),
+        "requirementValidity": "OK",
+    }
+
+    return {"summary": {"class": payload.className, "level": payload.level, "weapon": weapon_name, "samples": n},
+            "analysis": analysis,
+            "details": {"spell": spell_out, "engine": engine, "weaponDpsReference": ref_dps}}
+
+# =============================================================================
+# FRONTEND REWRITE + INJECTION (import panel + live simulate)
+# =============================================================================
+
+def rewrite_frontend(html: str) -> str:
+    html = html.replace("https://api.wynncraft.com/v3/ability/tree/", "/api/ability/tree/")
+    html = html.replace("https://api.wynncraft.com/v3/ability/map/", "/api/ability/map/")
+    html = html.replace("https://api.wynncraft.com/v3/aspects/", "/api/aspects/")
+
+    injection = r"""
+<script>
+(function(){
+  function addImportPanel(){
+    const host = document.querySelector(".app-shell") || document.body;
+    const panel = document.createElement("div");
+    panel.style.margin = "12px 0";
+    panel.style.padding = "12px";
+    panel.style.border = "1px solid rgba(255,255,255,0.12)";
+    panel.style.borderRadius = "12px";
+    panel.style.background = "rgba(0,0,0,0.2)";
+    panel.innerHTML = `
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <input id="wbUrlInput" style="flex:1; min-width:280px; padding:10px; border-radius:10px; border:1px solid rgba(255,255,255,0.12); background:rgba(0,0,0,0.35); color:#fff;"
+          placeholder="Paste WynnBuilder URL here (builder/#...)" />
+        <button id="wbImportBtn" class="btn small primary" type="button">Import WynnBuilder</button>
+        <span id="wbImportStatus" style="font-size:12px; color:rgba(255,255,255,0.7);"></span>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:rgba(255,255,255,0.6);">
+        Tip: paste your roll overrides in Notes as JSON like {"_rolls": {"Item Name": {"_rollPct": 80}}}
+      </div>
+    `;
+    host.prepend(panel);
+
+    document.getElementById("wbImportBtn").addEventListener("click", async () => {
+      const url = document.getElementById("wbUrlInput").value.trim();
+      if (!url) return;
+      const status = document.getElementById("wbImportStatus");
+      status.textContent = "Importing…";
+      try {
+        const r = await fetch("/api/import/wynnbuilder", {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({url})
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "Import failed");
+        applyImport(data);
+        status.textContent = "Imported.";
+      } catch(e) {
+        status.textContent = "Import error: " + (e.message || e);
+      }
+    });
+  }
+
+  function setVal(id, v){
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.value = v ?? "";
+    el.dispatchEvent(new Event("input", {bubbles:true}));
+    el.dispatchEvent(new Event("change", {bubbles:true}));
+  }
+
+  function applyImport(decoded){
+    // decoded.loadout uses slot keys
+    setVal("weaponInput", decoded.loadout?.weapon || "");
+    setVal("helmetInput", decoded.loadout?.helmet || "");
+    setVal("chestplateInput", decoded.loadout?.chestplate || "");
+    setVal("leggingsInput", decoded.loadout?.leggings || "");
+    setVal("bootsInput", decoded.loadout?.boots || "");
+    setVal("ring1Input", decoded.loadout?.ring1 || "");
+    setVal("ring2Input", decoded.loadout?.ring2 || "");
+    setVal("braceletInput", decoded.loadout?.bracelet || "");
+    setVal("necklaceInput", decoded.loadout?.necklace || "");
+    setVal("levelInput", decoded.level || 105);
+
+    // If skillpoints are present, set them (fallback 0)
+    const sp = decoded.skillpoints || {};
+    setVal("strInput", sp.str ?? 0);
+    setVal("dexInput", sp.dex ?? 0);
+    setVal("intInput", sp.int ?? 0);
+    setVal("defInput", sp.def ?? 0);
+    setVal("agiInput", sp.agi ?? 0);
+  }
+
+  let t = null;
+  function safeJsonParse(s){ try{ return JSON.parse(s); }catch(e){ return null; } }
+
+  function collectSelectedNodesFromUI(){
+    try {
+      if (window.abilityApiState && window.abilityApiState.activeConfig && window.getSelectedAbilityIds) {
+        const set = window.getSelectedAbilityIds(window.abilityApiState.activeConfig);
+        return Array.from(set || []);
+      }
+    } catch(e){}
+    return [];
+  }
+
+  function collectState(){
+    const getVal = (id) => (document.getElementById(id)?.value ?? "");
+    const numVal = (id) => Number(getVal(id) || 0);
+
+    let overrides = {};
+    const notes = getVal("notesInput");
+    const parsed = safeJsonParse(notes);
+    if (parsed && parsed._rolls) overrides = parsed._rolls;
+
+    return {
+      className: getVal("classSelect"),
+      level: numVal("levelInput"),
+      goal: getVal("goalSelect"),
+      archetype: getVal("archetypeSelect"),
+      loadout: {
+        weapon: getVal("weaponInput"),
+        helmet: getVal("helmetInput") || null,
+        chestplate: getVal("chestplateInput") || null,
+        leggings: getVal("leggingsInput") || null,
+        boots: getVal("bootsInput") || null,
+        ring1: getVal("ring1Input") || null,
+        ring2: getVal("ring2Input") || null,
+        bracelet: getVal("braceletInput") || null,
+        necklace: getVal("necklaceInput") || null
+      },
+      skillpoints: {
+        str: numVal("strInput"),
+        dex: numVal("dexInput"),
+        int: numVal("intInput"),
+        def: numVal("defInput"),
+        agi: numVal("agiInput"),
+      },
+      selectedNodes: collectSelectedNodesFromUI(),
+      selectedAspects: {},
+      itemRollOverrides: overrides,
+      engineKnobs: {active_totems:1, puppet_uptime:1.0, effigy_uptime:1.0, hummingbird_uptime:1.0},
+      nSamples: 1200,
+      seed: 1337
+    };
+  }
+
+  async function callBackend(){
+    try{
+      const payload = collectState();
+      if (!payload.loadout.weapon) return;
+      const r = await fetch("/api/simulate", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+      const data = await r.json();
+      if (!r.ok) return;
+
+      const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+      setText("totalDamage", (data.analysis.totalDamage ?? 0).toLocaleString());
+      setText("effectiveHealth", (data.analysis.effectiveHealth ?? 0).toLocaleString());
+      setText("manaSustain", data.analysis.manaSustain ?? "0.0");
+      setText("raidViability", data.analysis.raidViability ?? "0%");
+      setText("spellDamage", (data.analysis.spellDamage ?? 0).toLocaleString());
+      setText("meleeDamage", (data.analysis.meleeDamage ?? 0).toLocaleString());
+      setText("spellCost", data.analysis.spellCost ?? "0.0");
+      setText("damageScore", data.analysis.damageScore ?? "0.0");
+      setText("sustainScore", data.analysis.sustainScore ?? "0.0");
+      setText("defenseScore", data.analysis.defenseScore ?? "0.0");
+      setText("stabilityScore", data.analysis.stabilityScore ?? "0.0");
+      setText("requirementValidity", data.analysis.requirementValidity ?? "OK");
+    } catch(e){}
+  }
+
+  function schedule(){ clearTimeout(t); t = setTimeout(callBackend, 450); }
+
+  window.addEventListener("load", () => {
+    addImportPanel();
+    schedule();
+    [
+      "classSelect","archetypeSelect","levelInput","goalSelect","weaponInput",
+      "helmetInput","chestplateInput","leggingsInput","bootsInput",
+      "ring1Input","ring2Input","braceletInput","necklaceInput",
+      "strInput","dexInput","intInput","defInput","agiInput","abilityTreeInput","notesInput"
+    ].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener("input", schedule);
+      el.addEventListener("change", schedule);
+    });
+  });
+})();
+</script>
+"""
+    if "</body>" in html:
+        html = html.replace("</body>", injection + "\n</body>")
+    else:
+        html += injection
+    return html
+
+# =============================================================================
+# FASTAPI APP
+# =============================================================================
+
+app = FastAPI(title="Build System Backend (Python)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def _startup() -> None:
+    await ensure_item_index()
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    if not os.path.exists(HTML_PATH):
+        raise HTTPException(500, f"Frontend HTML not found at {HTML_PATH}")
+    with open(HTML_PATH, "r", encoding="utf-8") as f:
+        html = f.read()
+    return HTMLResponse(rewrite_frontend(html))
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "items_indexed": len(ITEM_INDEX), "frontend_html": HTML_PATH}
+
+# Proxies (your frontend needs these)
+@app.get("/api/ability/tree/{tree}")
+async def api_ability_tree(tree: str):
+    return JSONResponse(await get_ability_tree(tree))
+
+@app.get("/api/ability/map/{tree}")
+async def api_ability_map(tree: str):
+    return JSONResponse(await get_ability_map(tree))
+
+@app.get("/api/aspects/{tree}")
+async def api_aspects(tree: str):
+    return JSONResponse(await get_aspects_api(tree))
+
+@app.get("/api/item/database")
+async def api_item_database(fullResult: bool = True):
+    return JSONResponse(await get_item_database(full_result=fullResult))
+
+@app.get("/api/item/metadata")
+async def api_item_metadata():
+    return JSONResponse(await get_item_metadata())
+
+@app.get("/api/item/search/{query}")
+async def api_item_search(query: str):
+    return JSONResponse(await quick_search_item(query))
+
+# ✅ Generic WynnBuilder import
+@app.post("/api/import/wynnbuilder")
+async def api_import_wynnbuilder(req: ImportWBRequest):
+    url = req.url.strip()
+    h = url.split("#", 1)[1].strip() if "#" in url else url
+    decoded = await decode_wynnbuilder_hash(h)
+    return JSONResponse(decoded)
+
+# Simulate
+@app.post("/api/simulate")
+async def api_simulate(payload: SimPayload):
+    await ensure_item_index()
+    class_key = payload.className.lower().strip()
+    tree_key = class_key if class_key in {"archer","warrior","mage","assassin","shaman"} else "shaman"
+    tree_json = await get_ability_tree(tree_key)
+    return JSONResponse(simulate_with_tree(payload, tree_json))
